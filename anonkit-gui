@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+# anonkit-gui 0.0.1 - ArxOS-AnonKit GUI (GTK3), ArxOS-styled. Full anonymization control:
+# transparent Tor, new identity, MAC spoof, obfs4 bridges, VPN->Tor (VPNBook or your own),
+# and a one-click safety/leak test. Privileged actions run via pkexec (passwordless polkit rule),
+# with an ArxOS password-dialog fallback - never a terminal popup.
+import gi, subprocess, threading, re, sys, shlex, os, shutil
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, Gdk, GLib
+
+VERSION = "0.0.1"; AC = "#e8702a"
+ICON = "/usr/share/icons/ArxOS/arxos-anonkit.png"
+VENDORS = ["random", "apple", "samsung", "intel", "dell", "cisco", "tp-link", "huawei"]
+
+CSS = ("""
+window { background:#0a0a0c; }
+.title { font-family:'Playfair Display','DejaVu Serif',serif; font-style:italic; font-weight:600; font-size:22px; color:#ffffff; }
+.ver   { color:%(a)s; font-size:10px; font-weight:700; letter-spacing:1px; }
+.status{ font-size:12px; color:#c9c9d0; }
+.sub   { color:#8a8a92; font-size:11px; }
+.tip   { color:#cdb892; font-size:11px; font-style:italic; }
+button.act { background:rgba(255,255,255,0.05); border:1px solid rgba(232,112,42,0.40); border-radius:9px; color:#eee; padding:9px 12px; }
+button.act:hover { background:rgba(232,112,42,0.18); border-color:%(a)s; box-shadow:0 0 12px rgba(232,112,42,0.14); }
+switch:checked { background-color:%(a)s; }
+button.go { background:rgba(95,209,122,0.13); border:1px solid rgba(95,209,122,0.45); }
+button.go:hover { background:rgba(95,209,122,0.24); border-color:#5fd17a; }
+button.stop { border-color:rgba(255,90,90,0.45); }
+button.stop:hover { background:rgba(255,90,90,0.18); border-color:#ff5a5a; }
+.term { background:#050506; color:#cfd2d6; font-family:monospace; font-size:11px; border:1px solid rgba(232,112,42,0.22); border-radius:8px; padding:6px; }
+entry { background:#050506; color:#c9c9d0; border:1px solid rgba(232,112,42,0.25); border-radius:7px; }
+""" % {"a": AC}).encode()
+
+
+def sh(c, t=8):
+    try: return subprocess.run(c, shell=True, capture_output=True, text=True, timeout=t).stdout.strip()
+    except Exception: return ""
+
+
+class Anon(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="ArxOS AnonKit")
+        self.set_default_size(560, 580); self.set_position(Gtk.WindowPosition.CENTER)
+        try: self.set_icon_from_file(ICON)
+        except Exception: pass
+        p = Gtk.CssProvider(); p.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), p, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+        self.exit_ip = ""
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        for m in ("set_margin_top", "set_margin_bottom", "set_margin_start", "set_margin_end"): getattr(root, m)(16)
+        self.add(root)
+
+        hb = Gtk.Box(spacing=12)
+        try:
+            img = Gtk.Image.new_from_file(ICON); img.set_pixel_size(38); hb.pack_start(img, False, False, 0)
+        except Exception: pass
+        tcol = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        t = Gtk.Label(); t.set_markup("<span font='20' weight='800'>ArxOS <span foreground='%s'>AnonKit</span></span>" % AC)
+        t.set_xalign(0); t.get_style_context().add_class("title"); tcol.pack_start(t, False, False, 0)
+        v = Gtk.Label(label="REAL-WORLD OPSEC  ·  v" + VERSION); v.set_xalign(0); v.get_style_context().add_class("ver")
+        tcol.pack_start(v, False, False, 0); hb.pack_start(tcol, False, False, 0)
+        root.pack_start(hb, False, False, 0)
+
+        self.status = Gtk.Label(); self.status.set_xalign(0); self.status.get_style_context().add_class("status")
+        self.status.set_line_wrap(True); root.pack_start(self.status, False, False, 0)
+        root.pack_start(Gtk.Separator(), False, False, 0)
+
+        grid = Gtk.Grid(column_spacing=8, row_spacing=8, column_homogeneous=True)
+        acts = [
+            ("Start Tor",    "go",  lambda *_: self._priv(["anonkit", "-s"])),
+            ("VPN → Tor", "go", self._vpntor),
+            ("Snowflake",    "go",  lambda *_: self._priv(["anonkit", "--snowflake"])),
+            ("New Identity", "act", lambda *_: self._priv(["anonkit", "-r"])),
+            ("Safety Test",  "act", lambda *_: self._priv(["anonkit", "--safe"])),
+            ("Spoof MAC",    "act", self._spoof),
+            ("Bridge…", "act", self._bridge),
+        ]
+        for i, (lbl, cls, cb) in enumerate(acts):
+            b = Gtk.Button(label=lbl); b.get_style_context().add_class("act")
+            if cls != "act": b.get_style_context().add_class(cls)
+            b.connect("clicked", cb); grid.attach(b, i % 3, i // 3, 1, 1)
+        root.pack_start(grid, False, False, 0)
+
+        row = Gtk.Box(spacing=8)
+        ml = Gtk.Label(label="MAC vendor"); ml.get_style_context().add_class("sub"); row.pack_start(ml, False, False, 0)
+        self.vendor = Gtk.ComboBoxText()
+        for vn in VENDORS: self.vendor.append_text(vn)
+        self.vendor.set_active(0); row.pack_start(self.vendor, False, False, 0)
+        stopb = Gtk.Button(label="Stop / Clearnet"); stopb.get_style_context().add_class("act"); stopb.get_style_context().add_class("stop")
+        stopb.connect("clicked", lambda *_: self._priv(["anonkit", "-k"])); row.pack_end(stopb, False, False, 0)
+        root.pack_start(row, False, False, 0)
+
+        tip = Gtk.Label(); tip.set_xalign(0); tip.get_style_context().add_class("tip"); tip.set_line_wrap(True)
+        tip.set_text("Hide Tor from your ISP: Snowflake (free, no account, over WebRTC) or VPN → Tor (a VPN first, then Tor).")
+        root.pack_start(tip, False, False, 0)
+
+        self.out = Gtk.TextView(); self.out.set_editable(False); self.out.set_monospace(True)
+        self.out.get_style_context().add_class("term"); self.buf = self.out.get_buffer()
+        sc = Gtk.ScrolledWindow(); sc.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC); sc.add(self.out)
+        root.pack_start(sc, True, True, 0)
+
+        self._refresh(); GLib.timeout_add_seconds(4, self._refresh)
+
+    def _append(self, txt):
+        self.buf.insert(self.buf.get_end_iter(), txt)
+        self.out.scroll_to_mark(self.buf.get_insert(), 0, False, 0, 0); return False
+
+    def _stream(self, cmd, env=None):
+        # Run cmd, streaming its output into the pane; return the exit code.
+        rc = 127
+        try:
+            pr = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  text=True, bufsize=1, env=env)
+            for line in pr.stdout:
+                GLib.idle_add(self._append, re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", line))
+            rc = pr.wait()
+        except Exception as e:
+            GLib.idle_add(self._append, "error: %s\n" % e)
+        return rc
+
+    def _priv(self, args):
+        # Privileged AnonKit actions run via pkexec. The shipped polkit rule
+        # (49-arxos-anonkit.rules) returns YES for an active wheel session running our bins,
+        # so pkexec executes with NO password prompt and NO tty and streams straight into
+        # the pane - uniform for every action (Tor, safe test, MAC spoof, stop...). This
+        # replaces the old NOPASSWD `sudo -n` path, which broke the moment the desktop user's
+        # sudo started requiring a password and forced an ugly terminal popup. If the polkit
+        # rule is ever missing, we fall back to the ArxOS password dialog (arxos-askpass),
+        # never a terminal.
+        binp = shutil.which(args[0]) or ("/usr/local/bin/%s" % args[0])
+        self._append("\n$ %s\n" % " ".join(args))
+        def run():
+            rc = self._stream(["pkexec", binp] + list(args[1:]))
+            if rc in (126, 127):
+                # 126 = polkit denied/dismissed, 127 = pkexec could not exec. Fall back to the
+                # ArxOS password dialog (same helper arx uses), keeping the GUI's DISPLAY.
+                ap = "/usr/local/bin/arxos-askpass"
+                if os.path.exists(ap):
+                    GLib.idle_add(self._append, "  (authorizing via the ArxOS password dialog)\n")
+                    self._stream(["sudo", "-A", binp] + list(args[1:]),
+                                 env=dict(os.environ, SUDO_ASKPASS=ap))
+                else:
+                    GLib.idle_add(self._append, "  (authorization dismissed)\n")
+            GLib.idle_add(self._append, "— done —\n")
+            GLib.idle_add(self._refresh)
+        threading.Thread(target=run, daemon=True).start()
+
+    def _spoof(self, *_):
+        v = self.vendor.get_active_text() or "random"
+        args = ["anonkit", "-m"]
+        if v != "random": args += ["-v", v]
+        self._priv(args)
+
+    def _bridge(self, *_):
+        d = Gtk.Dialog(title="obfs4 bridge", transient_for=self, modal=True)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Start", Gtk.ResponseType.OK)
+        lab = Gtk.Label(label="Paste a bridge line (hides Tor from your ISP's DPI without a VPN):"); lab.set_xalign(0)
+        e = Gtk.Entry(); e.set_placeholder_text("obfs4 1.2.3.4:443 FINGERPRINT cert=... iat-mode=0"); e.set_size_request(420, -1)
+        box = d.get_content_area(); box.set_spacing(6); box.add(lab); box.add(e); d.show_all()
+        ok = d.run() == Gtk.ResponseType.OK; line = e.get_text().strip(); d.destroy()
+        if ok and line: self._priv(["anonkit", "-s", "-b", line])
+
+    def _ovpn_pick(self, title):
+        fc = Gtk.FileChooserDialog(title=title, parent=self, action=Gtk.FileChooserAction.OPEN)
+        fc.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Connect", Gtk.ResponseType.OK)
+        ff = Gtk.FileFilter(); ff.set_name("OpenVPN config / zip")
+        for pat in ("*.ovpn", "*.conf", "*.zip"): ff.add_pattern(pat)
+        fc.add_filter(ff)
+        ok = fc.run() == Gtk.ResponseType.OK; f = fc.get_filename(); fc.destroy()
+        return f if ok else None
+
+    def _ask(self, title, placeholder):
+        d = Gtk.Dialog(title=title, transient_for=self, modal=True)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "OK", Gtk.ResponseType.OK)
+        e = Gtk.Entry(); e.set_placeholder_text(placeholder); e.set_activates_default(True); e.set_size_request(320, -1)
+        d.get_content_area().add(e); d.set_default_response(Gtk.ResponseType.OK); d.show_all()
+        v = e.get_text().strip() if d.run() == Gtk.ResponseType.OK else None
+        d.destroy(); return v
+
+    def _vpntor(self, *_):
+        d = Gtk.Dialog(title="VPN → Tor", transient_for=self, modal=True)
+        d.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        d.add_button("My .ovpn", 2); d.add_button("VPN Gate (auto)", 3); d.add_button("VPNBook (fastest)", 4)
+        m = Gtk.Label(); m.set_line_wrap(True); m.set_xalign(0); m.set_max_width_chars(58)
+        m.set_markup("Connect a VPN first, then Tor — your ISP only sees the VPN, never Tor.\n\n"
+                     "<b>VPNBook (fastest)</b>: dedicated servers, but VPNBook gates the config behind a CAPTCHA, "
+                     "so this opens their page — download a config and copy the password, then pick the file here.\n"
+                     "<b>VPN Gate (auto)</b>: fully automatic free public relays (slower, nothing to download).\n"
+                     "<b>My .ovpn</b>: your own trusted VPN (best for real OPSEC).")
+        d.get_content_area().add(m); d.show_all()
+        r = d.run(); d.destroy()
+        if r == 3:
+            self._priv(["arxos-vpntor"])
+        elif r == 2:
+            f = self._ovpn_pick("Select your .ovpn")
+            if f: self._priv(["arxos-vpntor", "--own", f])
+        elif r == 4:
+            try: subprocess.Popen(["xdg-open", "https://www.vpnbook.com/freevpn"])
+            except Exception: pass
+            f = self._ovpn_pick("Pick the VPNBook .ovpn / .zip you downloaded")
+            if not f: return
+            pw = self._ask("VPNBook password", "paste the password shown on vpnbook.com")
+            args = ["arxos-vpntor", "--own", f, "--user", "vpnbook"]
+            if pw: args += ["--pass", pw]
+            self._priv(args)
+
+    def _refresh(self):
+        tor = sh("systemctl is-active tor-anonkit") == "active"
+        vpn = bool(sh("ip -o link show up 2>/dev/null | grep -oE ': (tun|wg|tap)[0-9]'"))
+        parts = []
+        if tor:
+            parts.append("<span foreground='#5fd17a' weight='700'>● Tor active</span>" + ("  ·  exit %s" % self.exit_ip if self.exit_ip else ""))
+        else:
+            parts.append("<span foreground='#8a8a92'>○ clearnet (Tor off)</span>")
+        parts.append("<span foreground='#5fd17a'>VPN up</span>" if vpn else "<span foreground='#8a8a92'>no VPN</span>")
+        if tor and not vpn:
+            parts.append("<span foreground='%s'>ISP can see Tor — use VPN→Tor or a bridge</span>" % AC)
+        self.status.set_markup("   ·   ".join(parts))
+        if tor and not self.exit_ip:
+            def ipget():
+                ip = sh("curl -s --max-time 8 --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip", 10)
+                mm = re.search(r'"IP":"([^"]+)"', ip or "")
+                if mm: self.exit_ip = mm.group(1)
+            threading.Thread(target=ipget, daemon=True).start()
+        if not tor: self.exit_ip = ""
+        return True
+
+
+if __name__ == "__main__":
+    if "--version" in sys.argv or "-V" in sys.argv:
+        print("anonkit-gui %s (ArxOS)" % VERSION); sys.exit(0)
+    w = Anon(); w.connect("destroy", Gtk.main_quit); w.show_all(); Gtk.main()

@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+# arxos-vpntor 0.0.1 - VPN -> Tor chain for ArxOS AnonKit.
+# Connects a VPN FIRST, then routes everything through Tor (VPN->Tor) so the ISP
+# only ever sees encrypted VPN traffic and never learns you use Tor.
+#
+# Default free source = VPN Gate (https://www.vpngate.net), a public academic relay
+# pool whose API returns ready-to-use OpenVPN configs (no account, no password).
+# The relays are volunteer run and flaky, so we fetch several candidates and try
+# them in turn until one tunnel actually comes up.
+#
+#   arxos-vpntor                         auto: try VPN Gate servers -> VPN -> Tor
+#   arxos-vpntor --country US            prefer a country (US, JP, KR, DE, ...)
+#   arxos-vpntor --own FILE.ovpn [--user U --pass P]   your own trusted VPN -> Tor
+#   arxos-vpntor --stop                  tear down (Tor first, then VPN)
+#   arxos-vpntor --status                show VPN + Tor state
+#
+# NOTE: a free public VPN means you trust the relay operator instead of your ISP.
+# For serious OPSEC use your own VPN (--own) or an obfs4/Snowflake bridge.
+set -u
+# pkexec (how the AnonKit GUI elevates us) sanitizes PATH and drops /usr/local/bin, so a
+# bare `anonkit` call would fail with "command not found". Put our bin dirs back on PATH.
+export PATH="/usr/local/bin:/usr/local/sbin:$PATH"
+GR=$'\033[1;32m'; AC=$'\033[38;5;208m'; RD=$'\033[1;31m'; RS=$'\033[0m'
+# status goes to STDERR so command substitution ($(fetch_vpngate)) stays clean
+say(){ printf "  ${AC}>>${RS} %s\n" "$*" >&2; }
+ok(){  printf "  ${GR}[ok]${RS} %s\n" "$*" >&2; }
+err(){ printf "  ${RD}[xx]${RS} %s\n" "$*" >&2; }
+[ "$(id -u)" -eq 0 ] || { err "must run as root (the AnonKit GUI elevates with pkexec)"; exit 1; }
+
+STATE=/run/arxos-vpntor; mkdir -p "$STATE"
+need(){ command -v "$1" >/dev/null 2>&1; }
+for p in openvpn curl python3; do need "$p" || { say "installing $p"; pacman -S --noconfirm --needed "$p" >/dev/null 2>&1; }; done
+
+real_ip(){ curl -s --max-time 8 https://api.ipify.org 2>/dev/null; }
+vpn_up(){ ip -o link show up 2>/dev/null | grep -qE ': (tun|tap|wg)[0-9]'; }
+
+# Anti-forensic config destruction. $STATE is on /run (tmpfs) so config material never touches
+# persistent disk; this shred+rm also clears it from RAM. Called right after the tunnel is up
+# (openvpn has already parsed the config + cached its auth in memory, so the files are dead
+# weight from that point) and on every teardown/kill — so the configs are "destructed each time
+# the session is killed", leaving nothing to recover.
+wipe_configs(){
+  [ -d "$STATE" ] || return 0
+  find "$STATE" -type f \( -name '*.ovpn' -o -name 'creds' -o -name '*.csv' -o -name '*.zip' -o -name '*.conf' \) -exec shred -u -n1 {} + 2>/dev/null
+  rm -rf "$STATE"/vpngate "$STATE"/own "$STATE"/vpnbook 2>/dev/null
+}
+# a kill/hangup while we're still setting up must not leave partial configs behind
+trap wipe_configs INT TERM HUP
+
+# fetch VPN Gate list, write up to 6 candidate configs (TCP preferred), print the COUNT to stdout
+fetch_vpngate(){
+  local d="$STATE/vpngate"; rm -rf "$d"; mkdir -p "$d"
+  say "fetching the VPN Gate public server list"
+  curl -fsSL --max-time 25 -A 'Mozilla/5.0' 'https://www.vpngate.net/api/iphone/' -o "$d/list.csv" \
+    || { err "could not reach vpngate.net"; return 1; }
+  python3 - "$d/list.csv" "$d" "${COUNTRY:-}" <<'PY'
+import csv, base64, sys, os
+src, outdir, want = sys.argv[1], sys.argv[2], sys.argv[3].upper()
+rows = list(csv.reader(open(src, encoding="utf-8", errors="ignore")))
+hdr = [h.strip('*#') for h in rows[1]]
+ci = hdr.index('OpenVPN_ConfigData_Base64'); cc = hdr.index('CountryShort'); sp = hdr.index('Speed')
+def collect(country_filter):
+    out = []
+    for r in rows[2:]:
+        if len(r) <= ci or len(r[ci]) < 200: continue
+        if country_filter and r[cc].upper() != country_filter: continue
+        try: spd = int(r[sp])
+        except Exception: spd = 0
+        cfg = base64.b64decode(r[ci]).decode('latin1', 'ignore')
+        out.append((spd, cfg, r[cc], 'tcp' if 'proto tcp' in cfg else 'udp'))
+    return out
+cand = collect(want) or collect("")
+cand.sort(key=lambda x: (x[3] != 'tcp', -x[0]))   # TCP first, then fastest
+n = 0
+for spd, cfg, country, proto in cand[:6]:
+    open(os.path.join(outdir, "cand-%d.ovpn" % n), "w").write(cfg)
+    sys.stderr.write("  candidate %d: %s/%s\n" % (n + 1, country, proto))
+    n += 1
+print(n)
+PY
+}
+
+# Refuse an OpenVPN config that could execute code as root. This tool runs openvpn as
+# root and is reachable passwordless via pkexec (polkit rule), so a hostile config must
+# never run scripts or load plugins. `--script-security 0` (below) disables user scripts,
+# but `plugin` loads a shared object regardless of script-security, so we reject those
+# directives outright - closing the "malicious --own .ovpn -> root" local-privesc path.
+_ovpn_is_safe(){ # $1 = path
+  local bad
+  bad=$(grep -inE '^[[:space:]]*(up|down|script-security|plugin|route-up|route-pre-down|tls-verify|auth-user-pass-verify|ipchange|learn-address|client-connect|client-disconnect|tls-crypt-v2-verify|auth-gen-token-secret)([[:space:]]|$)' "$1" 2>/dev/null | head -4)
+  if [ -n "$bad" ]; then
+    err "refused: this VPN config can run code as root (unsafe directives):"
+    printf '%s\n' "$bad" | sed 's/^/      /' >&2
+    err "use a config without up/down/script-security/plugin/verify directives."
+    return 1
+  fi
+  return 0
+}
+
+connect_vpn(){   # $1 ovpn  $2 creds(optional) -> 0 if the tunnel comes up
+  local ovpn="$1" creds="${2:-}"
+  _ovpn_is_safe "$ovpn" || return 1
+  pkill -f 'openvpn --config' 2>/dev/null; sleep 1
+  : > "$STATE/openvpn.log"
+  # --script-security 0: never call any user-defined script from the config (defense in depth
+  # on top of the _ovpn_is_safe scan above), so even a trusted-looking config cannot exec.
+  local args=(--config "$ovpn" --script-security 0 --auth-nocache --connect-timeout 10 --connect-retry-max 2
+              --redirect-gateway def1 --daemon --writepid "$STATE/openvpn.pid" --log "$STATE/openvpn.log")
+  [ -n "$creds" ] && args+=(--auth-user-pass "$creds")
+  ( cd "$(dirname "$ovpn")" && openvpn "${args[@]}" ) 2>/dev/null
+  local i
+  for i in $(seq 1 18); do
+    vpn_up && { ok "VPN tunnel up"; return 0; }
+    grep -qiE 'AUTH_FAILED|TLS Error|Cannot resolve|Connection refused|fatal error|Exiting' "$STATE/openvpn.log" 2>/dev/null && break
+    sleep 1
+  done
+  local why; why=$(grep -iE 'AUTH_FAILED|TLS Error|Cannot resolve|refused|fatal|RESOLVE|Inactivity' "$STATE/openvpn.log" 2>/dev/null | tail -1 | sed 's/^[0-9: -]*//')
+  pkill -f 'openvpn --config' 2>/dev/null
+  err "did not connect${why:+ - $why}"
+  return 1
+}
+
+# VPNBook: download current OpenVPN bundles + extract the TCP-443 config. VPNBook rotates the
+# password every 1-2 weeks behind a Cloudflare Turnstile CAPTCHA, so it CANNOT be scraped — the
+# user supplies it with --pass (username is always 'vpnbook'; get the current password from
+# https://www.vpnbook.com/freevpn). Writes up to 5 candidates + the count to stdout.
+VPNBOOK_SERVERS="de220 ca196 ca149 fr200 fr231 pl134 pl140 uk205 uk68 us16"
+fetch_vpnbook(){
+  need unzip || pacman -S --noconfirm --needed unzip >/dev/null 2>&1
+  local d="$STATE/vpnbook"; rm -rf "$d"; mkdir -p "$d"; local n=0 s ov
+  say "fetching VPNBook OpenVPN bundles"
+  for s in $VPNBOOK_SERVERS; do
+    curl -fsSL --max-time 20 -A 'Mozilla/5.0' "https://www.vpnbook.com/free-openvpn-account/vpnbook-openvpn-$s.zip" -o "$d/$s.zip" 2>/dev/null || continue
+    unzip -o -q "$d/$s.zip" -d "$d/$s" 2>/dev/null || { rm -f "$d/$s.zip"; continue; }
+    ov=$(ls "$d/$s"/*/vpnbook-*-tcp443.ovpn 2>/dev/null | head -1); [ -z "$ov" ] && ov=$(ls "$d/$s"/*/*.ovpn 2>/dev/null | head -1)
+    rm -f "$d/$s.zip"
+    [ -n "$ov" ] && { cp "$ov" "$d/cand-$n.ovpn"; n=$((n+1)); }
+    [ "$n" -ge 5 ] && break
+  done
+  echo "$n"
+}
+
+start(){
+  local ovpn before after creds=""
+  before=$(real_ip); say "real IP (no VPN): ${before:-?}"
+  if [ "${OWN:-}" ]; then
+    case "$OWN" in *.zip)
+      need unzip || pacman -S --noconfirm --needed unzip >/dev/null 2>&1
+      local ud="$STATE/own"; rm -rf "$ud"; mkdir -p "$ud"; unzip -o -q "$OWN" -d "$ud" 2>/dev/null
+      OWN=$(ls "$ud"/*tcp443*.ovpn 2>/dev/null | head -1); [ -z "$OWN" ] && OWN=$(ls "$ud"/*.ovpn 2>/dev/null | head -1)
+      [ -z "$OWN" ] && { err "no .ovpn inside the archive"; exit 1; }; say "using $(basename "$OWN")" ;;
+    esac
+    creds=""
+    if [ "${VUSER:-}" ]; then creds="$STATE/creds"; printf '%s\n%s\n' "$VUSER" "${VPASS:-}" > "$creds"; chmod 600 "$creds"; fi
+    say "connecting your VPN: $(basename "$OWN")"
+    connect_vpn "$OWN" "$creds" || { err "your VPN config did not connect"; exit 1; }
+  elif [ "${VPNBOOK:-}" ]; then
+    [ -n "${VPASS:-}" ] || { err "VPNBook needs the current password: --pass <pw> (get it from https://www.vpnbook.com/freevpn; user is 'vpnbook', it rotates ~weekly behind a CAPTCHA)"; exit 1; }
+    local ncand; ncand=$(fetch_vpnbook); ncand=${ncand:-0}
+    [ "$ncand" -ge 1 ] 2>/dev/null || { err "could not fetch any VPNBook config (site unreachable?)"; exit 1; }
+    say "trying up to $ncand VPNBook servers"
+    creds="$STATE/creds"; printf 'vpnbook\n%s\n' "$VPASS" > "$creds"; chmod 600 "$creds"
+    local j connected=0
+    for j in $(seq 0 $((ncand - 1))); do
+      ovpn="$STATE/vpnbook/cand-$j.ovpn"; [ -f "$ovpn" ] || continue
+      say "server $((j + 1))/$ncand ..."
+      connect_vpn "$ovpn" "$creds" && { connected=1; break; }
+    done
+    [ "$connected" = 1 ] || { err "VPNBook did not connect - the password rotates ~weekly; refresh --pass from vpnbook.com/freevpn"; exit 1; }
+  else
+    local ncand; ncand=$(fetch_vpngate) || exit 1
+    ncand=${ncand:-0}
+    [ "$ncand" -ge 1 ] 2>/dev/null || { err "no usable VPN Gate servers in the feed"; exit 1; }
+    say "trying up to $ncand VPN Gate servers (they are volunteer relays)"
+    creds="$STATE/creds"; printf 'vpn\nvpn\n' > "$creds"; chmod 600 "$creds"
+    local j connected=0
+    for j in $(seq 0 $((ncand - 1))); do
+      ovpn="$STATE/vpngate/cand-$j.ovpn"; [ -f "$ovpn" ] || continue
+      say "server $((j + 1))/$ncand ..."
+      connect_vpn "$ovpn" "$creds" && { connected=1; break; }
+    done
+    [ "$connected" = 1 ] || { err "none of the $ncand servers connected. Try again, use --country, or --own FILE.ovpn"; exit 1; }
+  fi
+  after=$(real_ip); say "IP through VPN: ${after:-?}"
+  [ -n "$after" ] && [ -n "$before" ] && [ "$after" = "$before" ] && err "warning: IP did not change, the VPN may not be routing"
+  wipe_configs; say "VPN config material shredded (session is now RAM-only)"
+  say "chaining into Tor (VPN -> Tor)"
+  anonkit -s || { err "Tor start failed"; exit 1; }
+  ok "VPN -> Tor active. Your ISP sees only the VPN; Tor is hidden behind it."
+  say "verify the whole chain:  sudo anonkit --safe"
+}
+
+stop(){
+  say "stopping Tor"; anonkit -k 2>/dev/null
+  say "stopping VPN"; pkill -f 'openvpn --config' 2>/dev/null
+  [ -f "$STATE/openvpn.pid" ] && kill "$(cat "$STATE/openvpn.pid")" 2>/dev/null
+  wipe_configs; rm -rf "$STATE" 2>/dev/null
+  ok "VPN -> Tor torn down + configs destroyed; back to clearnet"
+}
+
+case "${1:-}" in
+  --stop)    stop ;;
+  --status)  vpn_up && ok "VPN: up" || err "VPN: down"
+             systemctl is-active tor-anonkit >/dev/null 2>&1 && ok "Tor: active" || err "Tor: off" ;;
+  --country) COUNTRY="${2:-}"; start ;;
+  --own)     OWN="${2:-}"; shift 2 || true
+             while [ $# -gt 0 ]; do case "$1" in --user) VUSER="$2"; shift 2;; --pass) VPASS="$2"; shift 2;; *) shift;; esac; done
+             [ -n "${OWN:-}" ] || { err "--own needs a FILE.ovpn"; exit 1; }; start ;;
+  --vpnbook) VPNBOOK=1; shift || true
+             while [ $# -gt 0 ]; do case "$1" in --pass) VPASS="$2"; shift 2;; --user) VUSER="$2"; shift 2;; *) shift;; esac; done
+             start ;;
+  --version|-V) echo "arxos-vpntor 0.0.1 (ArxOS)" ;;
+  *)         start ;;
+esac

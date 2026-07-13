@@ -1,0 +1,15 @@
+[package]
+name = "anond"
+version = "0.1.0"
+edition = "2021"
+description = "ARXOS anonymity daemon — fail-closed Tor + i2p + leak-proof DNS"
+
+[[bin]]
+name = "anond"
+path = "src/main.rs"
+
+# heavy deps are added per-module as each layer is implemented + leak-tested:
+#   tokio (supervision), rustables (typed nftables), reqwest+socks (verify), nix (proc/caps), serde
+[profile.release]
+lto = true
+strip = true
