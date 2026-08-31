@@ -1,11 +1,10 @@
-// ArxOS AnonKit — let the active wheel session run the AnonKit helpers via pkexec
-// without the broken text-agent fallback (a GUI has no controlling tty).
+// ArxOS AnonKit: let the active wheel session drive the anond anonymity daemon via
+// pkexec without the broken text-agent fallback (a GUI/Control Center has no tty).
 polkit.addRule(function(action, subject) {
     if (action.id == "org.freedesktop.policykit.exec" &&
         subject.isInGroup("wheel") && subject.active) {
         var prog = action.lookup("program");
-        if (prog == "/usr/local/bin/anonkit" ||
-            prog == "/usr/local/bin/arxos-vpntor") {
+        if (prog == "/usr/local/bin/anond") {
             return polkit.Result.YES;
         }
     }

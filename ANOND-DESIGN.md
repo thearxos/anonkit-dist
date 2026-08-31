@@ -1,6 +1,6 @@
-# anond — the ARXOS anonymity daemon (Rust rewrite of anonkit)
+# anond, the ARXOS anonymity daemon (Rust rewrite of anonkit)
 
-Goal: **complete, trustworthy anonymity** — Tor + i2p + leak-proof DNS brought up as one
+Goal: **complete, trustworthy anonymity**, Tor + i2p + leak-proof DNS brought up as one
 fail-closed system, memory-safe, self-verifying. Not a proxy wrapper. The current Python
 `anonkit.py` (Tor transparent proxy + nft kill-switch + `--safe` test) is the proven behaviour
 model; `anond` reimplements it in Rust and adds the i2p and DNS layers as first-class citizens.
@@ -35,14 +35,14 @@ Locked = kill-switch up, everything dropped except tor/i2pd bootstrap. We never 
 toward Active until verify passes; we fall back to Locked (blocked) the instant a probe fails.
 
 ## Layers
-- **Tor** (`tor` module): supervise `tor` with a generated torrc — TransPort 9040 + DNSPort 53 +
+- **Tor** (`tor` module): supervise `tor` with a generated torrc, TransPort 9040 + DNSPort 53 +
   SocksPort 9050, strong stream isolation, IPv6 off, bridges (obfs4/snowflake/meek), guard pinning.
   Transparent redirect of all clearnet TCP + DNS via nftables NAT. Handles clearnet and `.onion`.
-- **i2p** (`i2p` module): supervise `i2pd` — HTTP proxy 4444, SOCKS 4447, SAM 7656 off unless asked,
+- **i2p** (`i2p` module): supervise `i2pd`, HTTP proxy 4444, SOCKS 4447, SAM 7656 off unless asked,
   console on loopback only. `.i2p` traffic is routed to i2pd; i2pd's addressbook resolves eepsites.
   i2p is an overlay reached via its proxy (it has no TransPort), so `.i2p` routing is done at the
-  DNS/proxy layer (see below), not IP NAT — this is the honest, reliable way to bundle it.
-- **DNS** (`dns` module): a tiny loopback resolver policy — clearnet A/AAAA → Tor DNSPort; `*.i2p`
+  DNS/proxy layer (see below), not IP NAT, this is the honest, reliable way to bundle it.
+- **DNS** (`dns` module): a tiny loopback resolver policy, clearnet A/AAAA → Tor DNSPort; `*.i2p`
   → hand to i2pd (or NXDOMAIN to force proxy use); everything pinned, resolv.conf immutable.
 - **kill-switch** (`killswitch` module): typed nftables via `rustables` (fallback: `nft -f`).
   inet table, output default drop, nat redirects, ipv6 drop, uid exemptions for tor + i2pd.
