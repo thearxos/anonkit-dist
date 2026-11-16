@@ -1,0 +1,16 @@
+// ArxOS AnonKit — let the active wheel session run the AnonKit privacy helpers via pkexec
+// without the broken text-agent fallback (a GUI has no controlling tty).
+//
+// The Control Center (arxctl) elevates `arxonion` (per-app Tor isolation: shell / run / up /
+// down) through pkexec, so it is authorized here. `anond` itself is elevated via `sudo` in a
+// terminal hand-off, not pkexec, so it does not need a rule. (The retired Python `anonkit` and
+// `arxos-vpntor` bins that this rule used to name are gone — superseded by the Rust anond stack.)
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.policykit.exec" &&
+        subject.isInGroup("wheel") && subject.active) {
+        var prog = action.lookup("program");
+        if (prog == "/usr/local/bin/arxonion") {
+            return polkit.Result.YES;
+        }
+    }
+});
